@@ -1,6 +1,13 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+################################################################################
+# This code runs the GRPO training on a given model and dataset
+# Usage:
+# python3 GRPO_training.py --batch_size 2 --n_training 100 --beta 0.001 --gradient_accumulation_steps 8 --optim_name adam --optim_lr 1e-5 --num_train_epochs 20 Qwen/Qwen2.5-Math-1.5B-Instruct --num_iterations 1 
+################################################################################
+
+
 import argparse
 import math
 import os

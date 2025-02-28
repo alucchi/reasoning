@@ -1,6 +1,13 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+################################################################################
+# This code evaluates a given model on a given dataset and then output the
+# results to a text file
+# Usage:
+# python3 evaluate_model.py --batch_size 2 --use_training True --dataset_name MATH-500 --num_return_sequences 1 --model_name Qwen/Qwen2.5-Math-1.5B-Instruct
+################################################################################
+
 
 import torch
 
@@ -238,9 +245,6 @@ from collections import Counter
 correct_count = 0
 incorrect_count = 0
 all_responses = {}
-
-PREAMBLE = """As an expert problem solver solve step by step the following mathematical questions."""
-PROMPT = ""
 
 with open(output_filename + "_correct_answers.txt", "w") as correct_file, open(output_filename + "_incorrect_answers.txt", "w") as incorrect_file:
     for batch_start in range(0, len(data_test), batch_size):
