@@ -11,7 +11,23 @@
 
 import argparse
 from datasets import load_dataset
-from math_verify import verify
+from math_verify import parse, verify
+
+def enclose_if_needed(s):
+    # Ensure that s is a string and not None.                                                                                                                                                                              
+    if s is None:
+        return s
+    if not s.startswith('$'):
+        s = '$' + s
+    if not s.endswith('$'):
+        s = s + '$'
+    return s
+
+def parse_and_verify(a,b):
+    return verify(
+            parse(enclose_if_needed(a)),
+            parse(enclose_if_needed(b))
+    )
 
 parser = argparse.ArgumentParser(
     description="Load a dataset from the Hugging Face Hub and count how many times the 'Extracted Answer' equals the 'Ground Truth'."
@@ -43,7 +59,7 @@ total_records = len(dataset)
 
 # Iterate over the dataset and count matches between "Extracted Answer" and "Ground Truth"
 for record in dataset:
-    if verify(record.get("Extracted Answer"), record.get("Ground Truth")):
+    if parse_and_verify(record.get("Extracted Answer"), record.get("Ground Truth")):
         match_count += 1
 
 print(f"Total records evaluated: {total_records}")
