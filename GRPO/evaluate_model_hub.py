@@ -105,7 +105,7 @@ full_model_name = base_model_id.split("/")[-1] + ("_ft" if use_fine_tuned_model 
 
 n_training = -1
 
-max_tokens = 512
+max_tokens = 1024
 
 if not_random == True:
     do_sample = False
@@ -157,18 +157,20 @@ if dataset_name == "gsm8k":
     answer = 'answer'
     use_messages = False
 
+    data_train = data_train.map(lambda x: {"answer": find_number(x["answer"])}) # only extract the number
+    data_test = data_test.map(lambda x: {"answer": find_number(x["answer"])}) # only extract the number
+
 elif dataset_name == "MATH-500" or dataset_name == "HuggingFaceH4/MATH-500":
     data_train = load_dataset("HuggingFaceH4/MATH-500", split="test")
 
     print('dataset size:', len(data_train))
     
     question = 'problem'
-    answer = 'solution'
+    answer = 'answer'
     use_messages = False
     data_test = None
     
-else:
-    # numina                                                                                                       
+elif dataset_name == "AI-MO/NuminaMath-CoT":
     dataset = load_dataset(dataset_name)
     print('dataset size:', len(dataset["train"]), len(dataset["test"]))
     data_train = dataset["train"]
@@ -177,7 +179,19 @@ else:
     question = 'problem'
     answer = 'solution'
     use_messages = True
+elif dataset_name.split('/')[0] == 'alucchi':
+    data_train = load_dataset(dataset_name, "main")["train"]
+    data_test = None
 
+    question = "Question"
+    answer = "Ground Truth"
+    use_messages = False
+else:
+    print("Unkown dataset")
+    raise SystemExit(1)
+
+
+    
 if n_training > 0 and n_training < len(data_train):
     data_train = data_train.select(range(n_training))
 if data_test is not None and n_training > 0 and n_training < len(data_test):
@@ -215,38 +229,46 @@ from huggingface_hub import (
     repo_exists,
 )
 
-def find_numbers(x: str) -> list[str]:
-    """Finds all numbers in a string."""
-    # Search for number, possibly negative (hyphen), with thousand separators
-    # (comma), and with a decimal point (period inbetween digits).
-    numbers = re.compile(
-      r'-?[\d,]*\.?\d+',
-      re.MULTILINE | re.DOTALL | re.IGNORECASE,
-    ).findall(x)
-    return numbers
+import regex
 
+def extract_answer(response: str) -> str:
+    # This pattern does the following:
+    # - Optionally matches an opening math-mode delimiter: \(
+    # - Matches one or two literal backslashes followed by "boxed"
+    # - Matches a named group "braced" which recursively matches balanced braces:
+    #       { ( any sequence of non-brace characters or a recursively nested "braced" group )* }
+    # - Optionally matches a closing math-mode delimiter: \)
+    pattern = (
+        r'(?:\\\()?'
+        r'\\{1,2}boxed'
+        r'(?P<braced>\{(?:[^{}]+|(?P>braced))*\})'
+        r'(?:\\\))?'
+    )
+    # Find all matches in the response
+    matches = list(regex.finditer(pattern, response, regex.DOTALL))
+    # Iterate over matches in reverse order, returning the last one with non-empty content.
+    for m in reversed(matches):
+        content = m.group("braced")
+        # Remove the outermost braces
+        if content.startswith("{") and content.endswith("}"):
+            content = content[1:-1]
+        if content.strip():
+            return content.strip()
+    return ""
 
 def find_number(x: str,
                 answer_delimiter: str = 'The answer is') -> str:
-  """Finds the most relevant number in a string."""
-  # If model uses the answer delimiter, then select the first number following
-  # that format.
-  if answer_delimiter in x:
-    answer = x.split(answer_delimiter)[-1]
-    numbers = find_numbers(answer)
+    """Finds the most relevant (or last) number in a string, in canonical form."""
+    if answer_delimiter in x:
+        answer = x.split(answer_delimiter)[-1]
+        numbers = find_numbers(answer)
+        if numbers:
+            return numbers[0]
+
+    numbers = find_numbers(x)
     if numbers:
-      return numbers[0]
-
-  # In general, select the last number in the string.
-  numbers = find_numbers(x)
-  if numbers:
-    return numbers[-1]
-  return ''
-
-
-def maybe_remove_comma(x: str) -> str:
-    # Example: 5,600 -> 5600
-    return x.replace(',', '')
+        return numbers[-1]
+    return ''
 
 def save_dataset(dataset, push_to_hub, hub_dataset_id, revision, output_dir):
 
@@ -358,7 +380,7 @@ for batch_start in range(0, len(data_test), batch_size):
             # Clean response
             pattern = r"Cutting Knowledge Date: \w+ \d{4}\nToday Date: \d{2} \w+ \d{4}"
             r = re.sub(pattern, "", r).strip()
-            ans = maybe_remove_comma(find_number(r))
+            ans = extract_answer(r)
             numeric_answers.append(ans)
         numeric_answer_counts = Counter(numeric_answers)
         most_common_numeric_answer, _ = numeric_answer_counts.most_common(1)[0]
@@ -366,7 +388,7 @@ for batch_start in range(0, len(data_test), batch_size):
 
     for idx, (task, response) in enumerate(zip(batch_data, final_responses)):
         try:
-            gt_answer = maybe_remove_comma(find_number(task[answer]))
+            gt_answer = task[answer]
             # Create a record for this task
             record = {
                 "Task ID": batch_start + idx,
