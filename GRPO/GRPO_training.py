@@ -16,37 +16,48 @@ import torch
 
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from math_verify import parse, verify
+import regex
 
 ################################################################################
 # Helper functions used to define the reward function
 ################################################################################
 
-def find_numbers(x: str) -> list[str]:
-    """Finds all numbers in a string, returning them in a canonical form."""
-    pattern = re.compile(
-        r'-?[\d,]*\.?\d+',  # same as original
-        re.MULTILINE | re.DOTALL | re.IGNORECASE
+
+def extract_answer(response: str) -> str:
+    # This pattern does the following:
+    # - Optionally matches an opening math-mode delimiter: \(
+    # - Matches one or two literal backslashes followed by "boxed"
+    # - Matches a named group "braced" which recursively matches balanced braces:
+    #       { ( any sequence of non-brace characters or a recursively nested "braced" group )* }
+    # - Optionally matches a closing math-mode delimiter: \)
+    pattern = (
+        r'(?:\\\()?'
+        r'\\{1,2}boxed'
+        r'(?P<braced>\{(?:[^{}]+|(?P>braced))*\})'
+        r'(?:\\\))?'
     )
-    raw_numbers = pattern.findall(x)
+    # Find all matches in the response
+    matches = list(regex.finditer(pattern, response, regex.DOTALL))
+    # Iterate over matches in reverse order, returning the last one with non-empty content.
+    for m in reversed(matches):
+        content = m.group("braced")
+        # Remove the outermost braces
+        if content.startswith("{") and content.endswith("}"):
+            content = content[1:-1]
+        if content.strip():
+            return content.strip()
+    return ""
 
-    cleaned_numbers = []
-    for num_str in raw_numbers:
-        # Remove commas (e.g. "1,234.5" -> "1234.5")
-        no_comma = num_str.replace(',', '')
-
-        # Convert to float
-        val = float(no_comma)
-
-        # Convert float back to string.
-        # This example converts floats like 10.0 to "10" if it is an integer value.
-        if val.is_integer():
-            cleaned_numbers.append(str(int(val)))
-        else:
-            cleaned_numbers.append(str(val))
-
-    return cleaned_numbers
-
+def find_numbers(x: str) -> list[str]:
+    """Finds all numbers in a string."""
+    # Search for number, possibly negative (hyphen), with thousand separators
+    # (comma), and with a decimal point (period inbetween digits).
+    numbers = re.compile(
+      r'-?[\d,]*\.?\d+',
+      re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    ).findall(x)
+    return numbers
 
 def find_number(x: str,
                 answer_delimiter: str = 'The answer is') -> str:
@@ -63,10 +74,6 @@ def find_number(x: str,
     return ''
 
 
-def maybe_remove_comma(x: str) -> str:
-    """Example: 5,600 -> 5600."""
-    return x.replace(',', '')
-
 
 ################################################################################
 # Hyperparameters & Setup
@@ -78,7 +85,7 @@ parser.add_argument("--batch_size", type=int, default=4, # batch_size 8 is too m
                                     help="Batch size for training")
 parser.add_argument("--optim_name", type=str, default="adam",
                                     help="Name of the optimizer (e.g. sgd, adam, mars)")
-parser.add_argument("--n_training", type=int, default=100,
+parser.add_argument("--n_training", type=int, default=300,
                                     help="Number of training examples to use")
 parser.add_argument("--gradient_accumulation_steps", type=int, default=8,
                     help="Number of gradient accumulation steps")
@@ -90,6 +97,8 @@ parser.add_argument("--model_name", type=str, default="llama",
                                     help="llama or qwen")
 parser.add_argument("--num_train_epochs", type=int, default=100,
                                     help="Number of training epochs")
+parser.add_argument("--num_iterations", type=int, default=1,
+                                    help="Number of inner iterations for GRPO")
 
 
 args = parser.parse_args()
@@ -103,6 +112,35 @@ beta = args.beta
 optim_lr = args.optim_lr
 model_name = args.model_name
 num_train_epochs = args.num_train_epochs
+num_iterations = args.num_iterations
+
+#dataset_name = "gsm8k" # around 8K training datapoints
+#dataset_name = "HuggingFaceH4/MATH-500" # 500 datapoints
+dataset_name = "alucchi/Qwen2.5-Math-1.5B-Instruct_MATH-500_s16_hard"
+if model_name == "llama":
+    model_id = "meta-llama/Llama-3.2-1B-Instruct" # Lamma 3.2 model with 1B parameters
+elif model_name == "qwen":
+    model_id = "Qwen/Qwen2-0.5B-Instruct" # smaller model with 0.5B parameters
+else:
+    model_id = "Qwen/Qwen2.5-Math-1.5B-Instruct" # smaller model with 0.5B parameters
+max_tokens = 1024
+use_chat_template = True # If true, use specific prompt to ask model to reason step by step (CoT approach)
+num_trainable_layers = -1
+
+global_new_epoch = False # global variable used to login debug info about rewards
+
+print_info = False
+
+use_cues = False # currently experimenting with this, trying to give more cues in prompt to see if that helps
+
+model_shortname = model_id.split('/')[0]
+output_dir = "./grpo_m" + model_shortname + '_d' + dataset_name + '_n' + str(n_training) + '_e' + str(num_train_epochs) + '_o' + optim_name + str(optim_lr) + "_b" + str(batch_size) + '_' + str(gradient_accumulation_steps) + '_a' + str(beta)
+output_dir += 'mu_' + str(num_iterations) if num_iterations > 1 else ""
+output_log =  output_dir + '.txt'
+
+project_name = "GRPO_trl16_withgt_" + model_shortname
+run_name = "GRPO" +  "_m" + model_shortname + '_d' + dataset_name.split('/')[-1].split('.')[-1] + "_n" + str(n_training) + '_o' + optim_name + str(optim_lr) + "_b" + str(batch_size) + '_' + str(gradient_accumulation_steps) + '_a' + str(beta)
+run_name += 'mu_' + str(num_iterations) if num_iterations > 1 else ""
 
 print("batch_size", batch_size)
 print("optim_name", optim_name)
@@ -112,27 +150,11 @@ print("beta", beta)
 print("optim_lr", optim_lr)
 print("model_name", model_name)
 print("num_train_epochs", num_train_epochs)
-
-dataset_name = "gsm8k" # around 8K training datapoints
-#dataset_name = "HuggingFaceH4/MATH-500" # 500 datapoints
-if model_name == "llama":
-    model_id = "meta-llama/Llama-3.2-1B-Instruct" # Lamma 3.2 model with 1B parameters
-else:
-    model_id = "Qwen/Qwen2-0.5B-Instruct" # smaller model with 0.5B parameters
-max_tokens = 1024
-use_chat_template = True # If true, use specific prompt to ask model to reason step by step (CoT approach)
-num_trainable_layers = -1
-
-global_new_epoch = False # global variable used to login debug info about rewards
-
-print_info = False
-
-model_shortname = model_id.split('/')[0]
-output_dir = "./grpo_m" + model_shortname + '_d' + dataset_name + '_n' + str(n_training) + '_e' + str(num_train_epochs) + '_o' + optim_name + str(optim_lr) + "_b" + str(batch_size) + '_' + str(gradient_accumulation_steps) + '_a' + str(beta)
-output_log =  output_dir + '.txt'
-
-project_name = "GRPO_training2"
-run_name = project_name +  "_m" + model_shortname + '_d' + dataset_name.split('/')[-1].split('.')[-1] + "_n" + str(n_training) + '_o' + optim_name + str(optim_lr) + "_b" + str(batch_size) + '_' + str(gradient_accumulation_steps) + '_a' + str(beta)
+print("num_iterations", num_iterations)
+print("model_id", model_id)
+print("run_name", run_name)
+print("output_dir", output_dir)
+print("output_log", output_log)
 
 # Initialize wandb
 import wandb
@@ -176,13 +198,18 @@ if dataset_name == "gsm8k":
     data_train = data_train.rename_column("answer", "ground_truth")
 
     data_train = data_train.map(lambda x: {"ground_truth": find_number(x["ground_truth"])})
-else:
+elif dataset_name == "HuggingFaceH4/MATH-500":
     data_train = load_dataset(dataset_name, split="test").select(range(n_training)) # MATH-500 dataset
     data_train = data_train.rename_column("problem", "prompt")
-    data_train = data_train.rename_column("solution", "ground_truth")
+    data_train = data_train.rename_column("answer", "ground_truth") # column answer contains the final answer (the column solution contains a detailed answer)
+elif dataset_name.split('/')[0] == 'alucchi':
+    data_train = load_dataset(dataset_name, "main")["train"]
+    data_train = data_train.rename_column("Question", "prompt")
+    data_train = data_train.rename_column("Ground Truth", "ground_truth")
+else:
+    print("Unkown dataset")
+    raise SystemExit(1)
     
-    data_train = data_train.map(lambda x: {"ground_truth": find_number(x["ground_truth"])})
-
 # Calculate number of steps                                                                                                                                                                                                
 steps_per_epoch = math.ceil(len(data_train) / (batch_size * gradient_accumulation_steps))
 max_steps = num_train_epochs * steps_per_epoch
@@ -199,18 +226,21 @@ if use_chat_template:
     system_prompt = "Please reason step by step, and put your final answer within \\boxed{}."
 
     def add_formatted_prompt(example):
+        example_prompt = example["prompt"]
+        if use_cues:
+            example_prompt += "The final answer you need to find is " + example["ground_truth"] # experimental
         example["prompt"] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": example["prompt"]}
+            {"role": "user", "content": example_prompt}
         ]
         return example
-
+    
     data_train = data_train.map(add_formatted_prompt)
     data_train = data_train.map(apply_chat_template, fn_kwargs={"tokenizer": tokenizer})
 
 
 ################################################################################
-# Optimizer (not used at the moment, but one can change the optimizer as well)
+# Optimizer (not used at the moment)
 ################################################################################   
 if optim_name == "sgd":
     print("Using SGD optimizer\n")
@@ -247,13 +277,32 @@ stoi = {prompt: idx for idx, prompt in enumerate(unique_prompts)}
 
 import re
 
+def enclose_if_needed(s):
+    # Ensure that s is a string and not None.                                                                                                                                                                              
+    if s is None:
+        return s
+    if not s.startswith('$'):
+        s = '$' + s
+    if not s.endswith('$'):
+        s = s + '$'
+    return s
+
+def parse_and_verify(a,b):
+    return verify(
+            parse(enclose_if_needed(a)),
+            parse(enclose_if_needed(b))
+    )
+
 def reward_func(prompts, completions, ground_truth, **kwargs):
     global global_new_epoch
         
+    #ground_truth=[extract_answer(g) for g in ground_truth]
     # Regular expression to capture content inside \boxed{}
-    contents = [find_number(c) for c in completions]
+    #matches = [re.search(r"\\boxed\{(.*?)\}", completion) for completion in completions]
+    #contents = [match.group(1) if match else "" for match in matches]
+    contents = [extract_answer(c) for c in completions]
     # Reward 1 if the content is the same as the ground truth, 0 otherwise
-    out_reward = [1.0 if c == gt else 0.0 for c, gt in zip(contents, ground_truth)]
+    out_reward = [1.0 if parse_and_verify(c, gt) else 0.0 for c, gt in zip(contents, ground_truth)]
 
     if global_new_epoch:
         global_new_epoch = False
@@ -266,8 +315,8 @@ def reward_func(prompts, completions, ground_truth, **kwargs):
             print('prompt ids', prompt_ids)
             print('prompts', prompts)
             print('completions', completions)
-            print('completion numbers', [find_number(c) for c in completions])
-            print('ground_truth', [find_number(g) for g in ground_truth])
+            print('completion numbers', [extract_answer(c) for c in completions])
+            print('ground_truth', [g for g in ground_truth])
             print('contents', contents)
             print('out_reward', out_reward)
 
@@ -275,8 +324,9 @@ def reward_func(prompts, completions, ground_truth, **kwargs):
             f.write(f'prompt ids: {prompt_ids}\n')
             f.write(f'prompts: {prompts}\n')
             f.write(f'completions: {completions}\n')
-            f.write(f'completions: {[find_number(c) for c in completions]}\n')
-            f.write(f'ground_truth: {[find_number(g) for g in ground_truth]}\n')
+            f.write(f'completions: {[extract_answer(c) for c in completions]}\n')
+            f.write(f'ground_truth: {[g for g in ground_truth]}\n')
+            #f.write(f'matches: {matches}\n')
             f.write(f'out_reward: {out_reward}\n')
 
         
@@ -285,6 +335,18 @@ def reward_func(prompts, completions, ground_truth, **kwargs):
 # Another reward function, one can combine them by giving reward_funcs=[reward_func1, reward_func2] to GRPOTrainer
 def reward_len(completions, **kwargs):
     return [abs(20 - len(completion)) for completion in completions]
+
+def reward_box_format(completions, **kwargs):
+    rewards = []
+    # Regular expression to check for \boxed{...} pattern.
+    pattern = r'\\boxed\{.*?\}'
+    
+    for completion in completions:
+        if re.search(pattern, completion, re.DOTALL):
+            rewards.append(1)
+        else:
+            rewards.append(0)
+    return rewards
 
 ################################################################################
 # GRPO Training Setup
@@ -351,21 +413,21 @@ training_args = GRPOConfig(
     bf16=True,            # or fp16 if your GPU doesn't support bf16
     learning_rate=optim_lr,
     beta=beta,
-    num_generations=8,
-    max_completion_length=512,
+    #weight_decay = 1e-4,
+    #warmup_ratio = 0.1 # CHANGE THIS!!!!!!!!!!!!!!!!!!
+    #max_grad_norm=0.1,
+    num_generations=batch_size,
+    num_iterations=num_iterations,
+    max_completion_length=1024,
     use_vllm=True,
     vllm_gpu_memory_utilization=0.3,
     vllm_device="auto"
-    # Other parameters worth considering...
-    #weight_decay = 1e-4,
-    #warmup_ratio = 0.1,
-    #max_grad_norm=0.1,
 )
 
 trainer = GRPOTrainer(
     model=model,
     processing_class=tokenizer,
-    reward_funcs=reward_func,
+    reward_funcs=[reward_func, reward_box_format],
     args=training_args,
     train_dataset=data_train,
     # Options to set the optimizer
