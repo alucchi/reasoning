@@ -73,8 +73,6 @@ def find_number(x: str,
         return numbers[-1]
     return ''
 
-
-
 ################################################################################
 # Hyperparameters & Setup
 ################################################################################
@@ -99,6 +97,8 @@ parser.add_argument("--num_train_epochs", type=int, default=100,
                                     help="Number of training epochs")
 parser.add_argument("--num_iterations", type=int, default=1,
                                     help="Number of inner iterations for GRPO")
+parser.add_argument("--dataset_name", type=str, default="HuggingFaceH4/MATH-500",
+                                    help="Name of the dataset, e.g. HuggingFaceH4/MATH-500 or gsm8k")
 
 
 args = parser.parse_args()
@@ -113,10 +113,9 @@ optim_lr = args.optim_lr
 model_name = args.model_name
 num_train_epochs = args.num_train_epochs
 num_iterations = args.num_iterations
+dataset_name = args.dataset_name
+#dataset_name = "alucchi/Qwen2.5-Math-1.5B-Instruct_MATH-500_s16_hard"
 
-#dataset_name = "gsm8k" # around 8K training datapoints
-#dataset_name = "HuggingFaceH4/MATH-500" # 500 datapoints
-dataset_name = "alucchi/Qwen2.5-Math-1.5B-Instruct_MATH-500_s16_hard"
 if model_name == "llama":
     model_id = "meta-llama/Llama-3.2-1B-Instruct" # Lamma 3.2 model with 1B parameters
 elif model_name == "qwen":
@@ -138,7 +137,7 @@ output_dir = "./grpo_m" + model_shortname + '_d' + dataset_name + '_n' + str(n_t
 output_dir += 'mu_' + str(num_iterations) if num_iterations > 1 else ""
 output_log =  output_dir + '.txt'
 
-project_name = "GRPO_trl16_withgt_" + model_shortname
+project_name = "GRPO_trl16_r4_" + model_shortname
 run_name = "GRPO" +  "_m" + model_shortname + '_d' + dataset_name.split('/')[-1].split('.')[-1] + "_n" + str(n_training) + '_o' + optim_name + str(optim_lr) + "_b" + str(batch_size) + '_' + str(gradient_accumulation_steps) + '_a' + str(beta)
 run_name += 'mu_' + str(num_iterations) if num_iterations > 1 else ""
 
@@ -152,6 +151,7 @@ print("model_name", model_name)
 print("num_train_epochs", num_train_epochs)
 print("num_iterations", num_iterations)
 print("model_id", model_id)
+print("dataset_name", dataset_name)
 print("run_name", run_name)
 print("output_dir", output_dir)
 print("output_log", output_log)
@@ -187,7 +187,10 @@ model.generation_config.pad_token_id = tokenizer.pad_token_id
 ################################################################################
 # Load Dataset
 ################################################################################
-
+# The data should be formatted as follows:
+# - prompt of the problem
+# - ground_truth contains a detailed solution
+# - answer if the final answer (without a detailed solution)
 
 print("Loading training dataset")
 if dataset_name == "gsm8k":
@@ -197,15 +200,22 @@ if dataset_name == "gsm8k":
     data_train = data_train.rename_column("question", "prompt")
     data_train = data_train.rename_column("answer", "ground_truth")
 
-    data_train = data_train.map(lambda x: {"ground_truth": find_number(x["ground_truth"])})
+    #data_train = data_train.map(lambda x: {"ground_truth": find_number(x["ground_truth"])})
+
+    # add a new column called answer that contains the final answer only
+    data_train = data_train.map(lambda x: {**x, "answer": find_number(x["ground_truth"])})
+    
 elif dataset_name == "HuggingFaceH4/MATH-500":
     data_train = load_dataset(dataset_name, split="test").select(range(n_training)) # MATH-500 dataset
     data_train = data_train.rename_column("problem", "prompt")
-    data_train = data_train.rename_column("answer", "ground_truth") # column answer contains the final answer (the column solution contains a detailed answer)
+    data_train = data_train.rename_column("solution", "ground_truth") # the column solution contains a detailed solution
+    
 elif dataset_name.split('/')[0] == 'alucchi':
+    # THIS IS NOT UP-TO-DATE!!!
     data_train = load_dataset(dataset_name, "main")["train"]
     data_train = data_train.rename_column("Question", "prompt")
-    data_train = data_train.rename_column("Ground Truth", "ground_truth")
+    data_train = data_train.rename_column("Ground Truth", "answer")
+    data_train = data_train.rename_column("Responses", "ground_truth")
 else:
     print("Unkown dataset")
     raise SystemExit(1)
@@ -293,16 +303,17 @@ def parse_and_verify(a,b):
             parse(enclose_if_needed(b))
     )
 
-def reward_func(prompts, completions, ground_truth, **kwargs):
+def reward_func(prompts, completions, ground_truth, answer, **kwargs):
     global global_new_epoch
-        
+
+    #ground_truth=[find_number(g) for g in ground_truth]
     #ground_truth=[extract_answer(g) for g in ground_truth]
     # Regular expression to capture content inside \boxed{}
     #matches = [re.search(r"\\boxed\{(.*?)\}", completion) for completion in completions]
     #contents = [match.group(1) if match else "" for match in matches]
     contents = [extract_answer(c) for c in completions]
     # Reward 1 if the content is the same as the ground truth, 0 otherwise
-    out_reward = [1.0 if parse_and_verify(c, gt) else 0.0 for c, gt in zip(contents, ground_truth)]
+    out_reward = [1.0 if parse_and_verify(c, gt) else 0.0 for c, gt in zip(contents, answer)]
 
     if global_new_epoch:
         global_new_epoch = False
@@ -324,8 +335,9 @@ def reward_func(prompts, completions, ground_truth, **kwargs):
             f.write(f'prompt ids: {prompt_ids}\n')
             f.write(f'prompts: {prompts}\n')
             f.write(f'completions: {completions}\n')
-            f.write(f'completions: {[extract_answer(c) for c in completions]}\n')
             f.write(f'ground_truth: {[g for g in ground_truth]}\n')
+            f.write(f'completion numbers: {[extract_answer(c) for c in completions]}\n')
+            f.write(f'ground_truth numbers: {[a for a in answer]}\n')
             #f.write(f'matches: {matches}\n')
             f.write(f'out_reward: {out_reward}\n')
 
@@ -347,6 +359,34 @@ def reward_box_format(completions, **kwargs):
         else:
             rewards.append(0)
     return rewards
+
+def reward_steps(completions, **kwargs):
+    pattern = r"(Step \d+:|^\d+\.|\n-|\n\*|First,|Second,|Next,|Finally,)"
+    completion_contents = [completion for completion in completions]
+    matches = [len(re.findall(pattern, content)) for content in completion_contents]
+    return [min(1.0, count / 3) for count in matches]
+
+def reward_reasoning_steps(completions, ground_truth, **kwargs):
+    rewards = []
+    for completion, gt in zip(completions, ground_truth):
+        # Tokenize the texts
+        inputs = tokenizer([completion, gt], return_tensors="pt", padding=True).to(model.device)
+        
+        # Forward pass with hidden states enabled
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True)
+        
+        # Extract the last hidden state from the hidden_states tuple
+        last_hidden_state = outputs.hidden_states[-1]
+        
+        # Compute sentence embeddings by averaging last hidden states
+        embeddings = last_hidden_state.mean(dim=1)
+        
+        # Calculate cosine similarity between the two embeddings
+        cos_sim = torch.nn.functional.cosine_similarity(embeddings[0].unsqueeze(0), embeddings[1].unsqueeze(0))
+        rewards.append(cos_sim.item())
+    return rewards
+
 
 ################################################################################
 # GRPO Training Setup
@@ -418,7 +458,7 @@ training_args = GRPOConfig(
     #max_grad_norm=0.1,
     num_generations=batch_size,
     num_iterations=num_iterations,
-    max_completion_length=1024,
+    max_completion_length=max_tokens,
     use_vllm=True,
     vllm_gpu_memory_utilization=0.3,
     vllm_device="auto"
@@ -427,7 +467,7 @@ training_args = GRPOConfig(
 trainer = GRPOTrainer(
     model=model,
     processing_class=tokenizer,
-    reward_funcs=[reward_func, reward_box_format],
+    reward_funcs=[reward_func, reward_box_format, reward_steps, reward_reasoning_steps],
     args=training_args,
     train_dataset=data_train,
     # Options to set the optimizer
