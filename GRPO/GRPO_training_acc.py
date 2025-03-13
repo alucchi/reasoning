@@ -18,6 +18,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from math_verify import parse, verify
 import regex
 
+# Added for accelerate parallelism
+from accelerate import Accelerator
+accelerator = Accelerator()
+
 ################################################################################
 # Helper functions used to define the reward function
 ################################################################################
@@ -133,7 +137,7 @@ output_dir = "./grpo_m" + model_shortname + '_d' + dataset_name + '_n' + str(n_t
 output_dir += 'mu_' + str(num_iterations) if num_iterations > 1 else ""
 output_log =  output_dir + '.txt'
 
-project_name = "GRPO_trl16_r4_" + model_shortname
+project_name = "GRPO_trl16_acc_" + model_shortname
 run_name = "GRPO" +  "_m" + model_shortname + '_d' + dataset_name.split('/')[-1].split('.')[-1] + "_n" + str(n_training) + '_o' + optim_name + str(optim_lr) + "_b" + str(batch_size) + '_' + str(gradient_accumulation_steps) + '_a' + str(beta)
 run_name += 'mu_' + str(num_iterations) if num_iterations > 1 else ""
 
@@ -176,6 +180,9 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "left"
 model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+# Wrap model with accelerator for GPU parallelism
+model = accelerator.prepare(model)
 
 ################################################################################
 # Load Dataset
@@ -260,7 +267,8 @@ else:
     from mars import MARS
     optimizer = MARS(model.parameters(), lr=optim_lr, weight_decay=1e-4, optimize_1d=False)
 
-    
+# Wrap optimizer with accelerator
+optimizer = accelerator.prepare(optimizer)
 
     
 ################################################################################
@@ -421,6 +429,10 @@ if num_trainable_layers != -1:
 
     print(f"Only the last {num_trainable_layers} layers are trainable.")
 
+# Force the vllm_device string to include a device id.
+vllm_device = str(accelerator.device)
+if ":" not in vllm_device and vllm_device.startswith("cuda"):
+    vllm_device = vllm_device + ":0"
 
         
 # Training arguments
@@ -441,7 +453,7 @@ training_args = GRPOConfig(
     max_completion_length=max_tokens,
     use_vllm=True,
     vllm_gpu_memory_utilization=0.3,
-    vllm_device="auto"
+    vllm_device=vllm_device
 )
 
 
@@ -453,7 +465,7 @@ trainer = GRPOTrainer(
     args=training_args,
     train_dataset=data_train,
     # Options to set the optimizer
-    #optimizers=(optimizer, None)
+    optimizers=(optimizer, None)
     #optimizers=(optimizer(filter(lambda p: p.requires_grad, model.parameters()), lr=optim_lr), None)
     #optimizers=(torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=optim_lr), None)
 )
