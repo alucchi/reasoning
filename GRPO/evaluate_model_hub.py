@@ -2,16 +2,19 @@
 # coding: utf-8
 
 ################################################################################
-# This code evaluates a given model on a given dataset and then upload the
-# results to the HuggingFace hub
+# This code evaluates a given model on a given dataset using vLLM for generation
+# and then uploads the results to the HuggingFace hub.
 # Usage:
 # python3 evaluate_model_hub.py --batch_size 2 --use_training True --dataset_name MATH-500 --num_return_sequences 1 --model_name Qwen/Qwen2.5-Math-1.5B-Instruct
 ################################################################################
 
+import time
+start_time = time.time()  # Start timing
 
-import torch
 
 not_random = False
+
+import torch
 
 if not_random == True:
     import numpy as np
@@ -29,6 +32,111 @@ if not_random == True:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+################################################################################
+# Helper functions
+
+import re
+import time
+from pathlib import Path
+
+from huggingface_hub import (
+    create_branch,
+    get_full_repo_name,
+    list_repo_commits,
+    repo_exists,
+)
+
+import regex
+
+def extract_answer(response: str) -> str:
+    # This pattern does the following:
+    # - Optionally matches an opening math-mode delimiter: \(
+    # - Matches one or two literal backslashes followed by "boxed"
+    # - Matches a named group "braced" which recursively matches balanced braces:
+    #       { ( any sequence of non-brace characters or a recursively nested "braced" group )* }
+    # - Optionally matches a closing math-mode delimiter: \)
+    pattern = (
+        r'(?:\\\()?'
+        r'\\{1,2}boxed'
+        r'(?P<braced>\{(?:[^{}]+|(?P>braced))*\})'
+        r'(?:\\\))?'
+    )
+    # Find all matches in the response
+    matches = list(regex.finditer(pattern, response, regex.DOTALL))
+    # Iterate over matches in reverse order, returning the last one with non-empty content.
+    for m in reversed(matches):
+        content = m.group("braced")
+        # Remove the outermost braces
+        if content.startswith("{") and content.endswith("}"):
+            content = content[1:-1]
+        if content.strip():
+            return content.strip()
+    return ""
+
+def find_numbers(x: str) -> list[str]:
+    """Finds all numbers in a string."""
+    # Search for number, possibly negative (hyphen), with thousand separators
+    # (comma), and with a decimal point (period inbetween digits).
+    numbers = re.compile(
+      r'-?[\d,]*\.?\d+',
+      re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    ).findall(x)
+    return numbers
+
+def find_number(x: str,
+                answer_delimiter: str = 'The answer is') -> str:
+    """Finds the most relevant (or last) number in a string, in canonical form."""
+    if answer_delimiter in x:
+        answer = x.split(answer_delimiter)[-1]
+        numbers = find_numbers(answer)
+        if numbers:
+            return numbers[0]
+
+    numbers = find_numbers(x)
+    if numbers:
+        return numbers[-1]
+    return ''
+
+def save_dataset(dataset, push_to_hub, hub_dataset_id, revision, output_dir):
+
+    #from huggingface_hub import login
+    #login(token = 'MY_LOGIN_HERE')
+    
+    if push_to_hub:
+        # Since concurrent pushes can get rejected by the Hub, we make several attempts to push the dataset with try/except
+        url = None
+        for _ in range(20):
+            try:
+                # Create branch from the repo's initial commit.
+                # This is needed to avoid branching from a commit on main that already has data
+                if repo_exists(hub_dataset_id, repo_type="dataset"):
+                    initial_commit = list_repo_commits(
+                        hub_dataset_id, repo_type="dataset"
+                    )[-1]
+                    create_branch(
+                        repo_id=hub_dataset_id,
+                        branch=revision,
+                        revision=initial_commit.commit_id,
+                        exist_ok=True,
+                        repo_type="dataset",
+                    )
+                url = dataset.push_to_hub(
+                    hub_dataset_id,
+                    revision=revision,
+                    split="train",
+                    private=False,
+                    commit_message=f"Add {revision}",
+                )
+                break
+            except Exception as e:
+                print(f"Error pushing dataset to the Hub: {e}")
+                time.sleep(5)
+        print(f"Pushed dataset to {url}")
+    else:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        dataset.to_json(f"{output_dir}/bon_completions.jsonl", lines=True)
+        print(f"Saved completions to {output_dir}/bon_completions.jsonl")
+    
 ################################################################################
 # Parsed parameters
 
@@ -74,6 +182,18 @@ parser.add_argument(
     #default="Qwen/Qwen2.5-0.5B-Instruct",
     help="Name of the model"
 )
+parser.add_argument(
+    "--hub_dataset_id", 
+    type=str, 
+    default=None,
+    help="Hub dataset id (defined automatically if not provided)"
+)
+parser.add_argument(
+        "--n_examples",
+        type=int,
+        default=-1,
+        help="Optional number of examples to evaluate (if not provided, all examples will be used)."
+    )
 
 args = parser.parse_args()
 
@@ -84,6 +204,7 @@ use_training = args.use_training
 batch_size = args.batch_size
 ft_model_name = args.ft_model_name
 num_return_sequences = args.num_return_sequences
+n_training = args.n_examples
 
 #base_model_id = "meta-llama/Llama-3.2-1B-Instruct"
 #base_model_id = "qwen/Qwen2-Math-72B-Instruct"
@@ -93,17 +214,16 @@ base_model_id = args.model_name
 print("dataset_name", dataset_name)
 print("use_fine_tuned_model", use_fine_tuned_model)
 print("use_training", use_training)
-print("batch_size:", batch_size)
+print("batch_size", batch_size)
 print("ft_model_name", ft_model_name)
-print("num_return_sequences:", num_return_sequences)
-print('Number of GPUs', torch.cuda.device_count())
+print("num_return_sequences", num_return_sequences)
+print("n_training", n_training)
+print("Number of GPUs", torch.cuda.device_count())
 
 ################################################################################
 # Parameters
 
 full_model_name = base_model_id.split("/")[-1] + ("_ft" if use_fine_tuned_model else "")
-
-n_training = -1
 
 max_tokens = 1024
 
@@ -112,8 +232,9 @@ if not_random == True:
     temperature = 0
 else:
     do_sample = True
-    temperature = 1.0
-
+    #temperature = 1.0
+    temperature = 0.7
+    
 output_filename = "eval_" + full_model_name + "_d" + dataset_name.split('/')[-1]
 output_filename += "_batch" + str(batch_size) # debug, remove later
 output_filename += "_evaltraining" if use_training else ""
@@ -121,7 +242,12 @@ output_filename += "_notrandom" if not_random else ""
 output_filename += ("_nseq" + str(num_return_sequences)) if num_return_sequences > 1 else ""
 print("output_filename", output_filename)
 revision = output_filename
-hub_dataset_id = 'alucchi/' + base_model_id.split("/")[-1] + '_' + dataset_name.split("/")[-1] + '_s' + str(num_return_sequences)
+
+if args.hub_dataset_id == None:
+    hub_dataset_id = 'alucchi/' + base_model_id.split("/")[-1] + '_' + dataset_name.split("/")[-1] + '_s' + str(num_return_sequences)
+else:
+    hub_dataset_id = args.hub_dataset_id
+print("hub_dataset_id", hub_dataset_id, len(hub_dataset_id))
 
 debug_mode = False # print more information
 
@@ -215,102 +341,6 @@ if use_training:
     print("Evaluating on training set")
     data_test = data_train
 
-################################################################################
-# Helper functions
-
-import re
-import time
-from pathlib import Path
-
-from huggingface_hub import (
-    create_branch,
-    get_full_repo_name,
-    list_repo_commits,
-    repo_exists,
-)
-
-import regex
-
-def extract_answer(response: str) -> str:
-    # This pattern does the following:
-    # - Optionally matches an opening math-mode delimiter: \(
-    # - Matches one or two literal backslashes followed by "boxed"
-    # - Matches a named group "braced" which recursively matches balanced braces:
-    #       { ( any sequence of non-brace characters or a recursively nested "braced" group )* }
-    # - Optionally matches a closing math-mode delimiter: \)
-    pattern = (
-        r'(?:\\\()?'
-        r'\\{1,2}boxed'
-        r'(?P<braced>\{(?:[^{}]+|(?P>braced))*\})'
-        r'(?:\\\))?'
-    )
-    # Find all matches in the response
-    matches = list(regex.finditer(pattern, response, regex.DOTALL))
-    # Iterate over matches in reverse order, returning the last one with non-empty content.
-    for m in reversed(matches):
-        content = m.group("braced")
-        # Remove the outermost braces
-        if content.startswith("{") and content.endswith("}"):
-            content = content[1:-1]
-        if content.strip():
-            return content.strip()
-    return ""
-
-def find_number(x: str,
-                answer_delimiter: str = 'The answer is') -> str:
-    """Finds the most relevant (or last) number in a string, in canonical form."""
-    if answer_delimiter in x:
-        answer = x.split(answer_delimiter)[-1]
-        numbers = find_numbers(answer)
-        if numbers:
-            return numbers[0]
-
-    numbers = find_numbers(x)
-    if numbers:
-        return numbers[-1]
-    return ''
-
-def save_dataset(dataset, push_to_hub, hub_dataset_id, revision, output_dir):
-
-    # Might need to authentificate first using by running the command: huggingface-cli login
-    # Alternatively:
-    # from huggingface_hub import login
-    # login(token = 'hf_YOURKEY')
-    
-    if push_to_hub:
-        # Since concurrent pushes can get rejected by the Hub, we make several attempts to push the dataset with try/except
-        url = None
-        for _ in range(20):
-            try:
-                # Create branch from the repo's initial commit.
-                # This is needed to avoid branching from a commit on main that already has data
-                if repo_exists(hub_dataset_id, repo_type="dataset"):
-                    initial_commit = list_repo_commits(
-                        hub_dataset_id, repo_type="dataset"
-                    )[-1]
-                    create_branch(
-                        repo_id=hub_dataset_id,
-                        branch=revision,
-                        revision=initial_commit.commit_id,
-                        exist_ok=True,
-                        repo_type="dataset",
-                    )
-                url = dataset.push_to_hub(
-                    hub_dataset_id,
-                    revision=revision,
-                    split="train",
-                    private=False,
-                    commit_message=f"Add {revision}",
-                )
-                break
-            except Exception as e:
-                print(f"Error pushing dataset to the Hub: {e}")
-                time.sleep(5)
-        print(f"Pushed dataset to {url}")
-    else:
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        dataset.to_json(f"{output_dir}/bon_completions.jsonl", lines=True)
-        print(f"Saved completions to {output_dir}/bon_completions.jsonl")
 
 ################################################################################
 # Main loop
@@ -436,3 +466,7 @@ for i in range(torch.cuda.device_count()):
     torch.cuda.synchronize()
     peak_memory = torch.cuda.max_memory_allocated(i)
     print(f"GPU {i}: Peak memory usage: {peak_memory / (1024**2)} MB")
+
+# Print total execution time
+end_time = time.time()
+print(f"Total execution time: {end_time - start_time:.2f} seconds")
